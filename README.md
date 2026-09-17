@@ -10,13 +10,21 @@ these failures do not look like bugs. The run completes, the report is
 well-formed, and the number is simply lower than the model deserves — which is
 indistinguishable, from the outside, from the model being worse.
 
-Three areas, in descending order of how well the cause is pinned down:
+| Area | Cause | Confidence | What ships |
+|---|---|---|---|
+| MATH-500 answer extraction | requested format outranked by `\boxed`; no string-answer target | **confirmed from source** | re-grader + extraction module |
+| LiveCodeBench stdin execution | candidate program is rewritten before execution | **minimal reproduction** | re-grader + upstream patch |
+| GPQA letter extraction | unknown | **not diagnosed** | re-grader only |
+| Run-killing harness faults | three separate ones, §7 | **confirmed from source** | import-time patches |
 
-| Area | Cause | Confidence |
-|---|---|---|
-| MATH-500 answer extraction | requested answer format outranked by `\boxed`; no string-answer target | **confirmed from source** |
-| LiveCodeBench stdin execution | candidate program is rewritten before execution | **minimal reproduction included** |
-| GPQA letter extraction | unknown | **not diagnosed — verifier only** |
+Two independent halves, and which you need depends on what you are doing:
+
+* **Re-grading finished runs** (`tools/`) — needs only the details files. This
+  is the complete path: it does not require LightEval to be patched, and every
+  correction is a script anyone can rerun on the same artefacts.
+* **Running new evaluations** (`lighteval_fix.harness`) — install before
+  LightEval's model modules import, so a run is not lost to a logging crash or
+  silently sampled differently than configured. See §7.
 
 Everything is verified by a test corpus that runs offline, with no model and no
 GPU. This repository contains no accuracy figures for any model: it ships the
@@ -62,11 +70,34 @@ the harness in ways nobody tracks. This repository calls LightEval's own
 ```bash
 pytest tests/ -q                   # the corpus; needs lighteval importable
 python -m tools.regrade --help
+python -m tools.regrade_lcb --help
 ```
 
 If `tests/test_answer_equivalence.py` cannot import LightEval it will fail
 rather than skip. That is intentional: a silently skipped correctness test is
 how a broken grader ships.
+
+### Re-grading runs made elsewhere
+
+The details files are all that is needed — no model, no GPU, no server:
+
+```bash
+# answers: MATH-500, GPQA, AIME, anything answer-shaped
+python -m tools.regrade     --details path/to/<task>/details --task math500
+
+# LiveCodeBench stdin problems: this one executes candidate programs
+python -m tools.regrade_lcb --details path/to/lcb/details
+```
+
+`tools/regrade_lcb.py` runs model-generated code as a subprocess with nothing
+but a timeout around it. Run it in a container or on a throwaway machine, never
+on a host holding anything you care about. LightEval's in-process path calls
+`reliability_guard` to disable `os.system` and friends; a subprocess cannot be
+guarded that way, and running the program as written is the whole point.
+
+Both tools print the harness's own number beside the re-graded one, so the
+correction is always visible as a delta rather than replacing the original
+silently.
 
 ---
 
@@ -361,18 +392,75 @@ reading diffs.
 
 ---
 
-## 7. Layout
+## 7. Faults that end a run before grading
 
-```
-lighteval_fix/
-  extraction.py      answer extraction + equivalence (MATH-500 and friends)
-  lcb_stdin.py       run a stdin candidate as written, compare its output
-patches/             the same changes as diffs against lighteval 6ba40c4
-tools/regrade.py     re-score a finished run from its details files
-tests/               the corpus: extraction, equivalence, and the LCB rewrite
+Not extraction, but the first things to hit in a new environment. `harness.py`
+installs all three; each raises if the upstream shape it depends on changed,
+because a silently inert patch is worse than none.
+
+```python
+import lighteval_fix.harness as harness
+harness.apply_all()                    # before lighteval's model modules load
 ```
 
-## 8. Limitations
+**`xxhash` is handed `str` where it accepts only bytes.** The details logger
+hashes three `str` values, so the run raises
+`TypeError: Strings must be encoded before hashing` **after every sample has
+been generated and scored**, and writes no result file. The whole generation
+budget is lost to a logging detail.
+
+**Sampling parameters are silently dropped.** `to_litellm_dict` forwards only
+seven fields; `top_k`, `min_p` and `presence_penalty` are accepted by the
+config model and then not sent. A protocol that fixes any of them reports
+numbers produced under different sampling, with no warning. A separate case:
+`top_k=-1` means "disabled" to an OpenAI-compatible SGLang server, but the
+config model constrains the field to >= 0 and rejects the config before a
+request is sent — pass such values through `forced=`. And
+`chat_template_kwargs` gates reasoning in some templates, so omitting it can
+evaluate a reasoning model with reasoning off, which looks like a weaker model
+rather than like a mistake.
+
+One trap worth stating plainly: those parameters ride in `extra_body`, which
+**litellm** unpacks. That is litellm's behaviour, not the server's. Code that
+POSTs raw JSON to `/v1/chat/completions` must put the fields at the **top
+level** — no server reads a nested `extra_body`, and the request is accepted
+while the parameters are ignored.
+
+**An unguarded SGLang import.** LightEval's SGLang backend does
+`from sglang.srt.hf_transformers_utils import get_tokenizer` at import time,
+and importing any LightEval model module pulls it in — including runs that use
+the endpoint backend and never touch SGLang. Current SGLang moved that module
+under `srt/utils/`, so the import fails before the first request. The patch
+leaves a forwarding shim rather than editing a package we do not own.
+
+---
+
+## 8. What an upstream MATH-500 fix would have to change
+
+The correction here is delivered by re-grading, not as a patch to
+`patches/`, and that is a deliberate choice rather than an omission. Fixing it
+upstream means two changes, and only one of them is small:
+
+* **The priority inversion** is small: `math_500` shares `Metrics.pass_at_k_math`
+  (`metrics/metrics.py:469-480`) with the AIME tasks, whose prompts *do*
+  mandate `\boxed{}`. Raising `boxed_match_priority` above the `ANSWER:` tier
+  would fix MATH-500 and break AIME, so it needs a second metric entry used
+  only by tasks whose prompt asks for a final line.
+* **The missing string target** is not small. `ExtractionTarget` is a union of
+  three configs (`extractive_match_utils.py:96`) with no string member, which
+  is why a word answer extracts nothing at all; LightEval's own comment asks
+  for a `StringExtractionConfig` (`dynamic_metrics.py:174`). Adding one touches
+  extraction, comparison and every task that uses them.
+
+Neither can be validated here the way the LCB patch was — that one has a
+minimal reproduction that runs in milliseconds, while these need a full
+evaluation against a model to show they changed the right scores. So they are
+specified rather than guessed at, and the re-grade path is what this repository
+stands behind.
+
+---
+
+## 9. Limitations
 
 * The line numbers are `6ba40c4`. Upstream moves; `patches/` will need
   refreshing, and the modules under `lighteval_fix/` are written to fail
@@ -383,3 +471,19 @@ tests/               the corpus: extraction, equivalence, and the LCB rewrite
 * GPQA is undiagnosed. See §4.
 * The LCB rewrite is shown to break one class of program, not all of them.
   See §3.
+
+---
+
+## 10. Layout
+
+```
+lighteval_fix/
+  extraction.py      answer extraction + equivalence (MATH-500 and friends)
+  lcb_stdin.py       run a stdin candidate as written, compare its output
+  harness.py         the three run-killing faults of §7
+patches/             upstream diffs against lighteval 6ba40c4
+tools/
+  regrade.py         re-score answers from a finished run's details
+  regrade_lcb.py     re-run LiveCodeBench stdin candidates and re-score
+tests/               extraction, equivalence, the LCB rewrite, the harness
+```
