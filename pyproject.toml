@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lighteval-fix"
+version = "0.1.0"
+description = "Eval-side fixes for LightEval: answer extraction and candidate-program execution"
+readme = "README.md"
+requires-python = ">=3.10"
+# LightEval itself is intentionally not declared as a dependency: it is pinned
+# by commit in the README, and pip would happily resolve a different one.
+# lighteval_fix.extraction imports it lazily, at comparison time, so the
+# extraction half and the LCB half are usable without it.
+dependencies = []
+
+[project.optional-dependencies]
+regrade = ["pyarrow"]           # reading LightEval's details parquet
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["lighteval_fix*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

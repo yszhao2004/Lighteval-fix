@@ -1,0 +1,65 @@
+diff --git a/src/lighteval/tasks/tasks/lcb/codegen_metrics.py b/src/lighteval/tasks/tasks/lcb/codegen_metrics.py
+index e2617ed..f45b71d 100644
+--- a/src/lighteval/tasks/tasks/lcb/codegen_metrics.py
++++ b/src/lighteval/tasks/tasks/lcb/codegen_metrics.py
+@@ -99,6 +99,34 @@ def clean_if_name(code: str) -> str:
+     return code
+ 
+ 
++def _module_level_bindings(statements: list) -> list[str]:
++    """Names the candidate binds at module level.
++
++    Collected so that wrapping the program in a function does not turn its
++    module namespace into a function-local one. Assignments, augmented and
++    annotated assignments, loop and with targets, and def/class names all
++    count; anything nested inside a function or class body does not, because
++    those were already local.
++    """
++    names: set[str] = set()
++    for statement in statements:
++        if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
++            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
++            for target in targets:
++                names.update(node.id for node in ast.walk(target) if isinstance(node, ast.Name))
++        elif isinstance(statement, (ast.For, ast.AsyncFor)):
++            names.update(node.id for node in ast.walk(statement.target) if isinstance(node, ast.Name))
++        elif isinstance(statement, (ast.With, ast.AsyncWith)):
++            for item in statement.items:
++                if item.optional_vars is not None:
++                    names.update(
++                        node.id for node in ast.walk(item.optional_vars) if isinstance(node, ast.Name)
++                    )
++        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++            names.add(statement.name)
++    return sorted(names)
++
++
+ def make_function(code: str) -> str:
+     try:
+         import_stmts = []
+@@ -110,13 +138,24 @@ def make_function(code: str) -> str:
+             else:
+                 all_other_stmts.append(stmt)
+ 
++        # Without this the wrapper silently changes the program's meaning:
++        # every module-level assignment becomes a local of wrapped_function,
++        # so a nested function that reaches its input through `global N`
++        # resolves to a module namespace where N was never assigned and dies
++        # with NameError. Declaring the module-level bindings global keeps
++        # them where the candidate expects them. Closures were already fine;
++        # this is for the names that go through the module namespace by name.
++        global_names = _module_level_bindings(all_other_stmts)
++        function_body = ([ast.Global(names=global_names)] if global_names else []) + all_other_stmts
++
+         function_ast = ast.FunctionDef(
+             name="wrapped_function",
+             args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+-            body=all_other_stmts,
++            body=function_body,
+             decorator_list=[],
+             lineno=-1,
+         )
++        ast.fix_missing_locations(function_ast)
+         main_code = (
+             import_string
+             + "\n"
