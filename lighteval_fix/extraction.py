@@ -84,17 +84,34 @@ def _last_boxed(text: str) -> str | None:
     return text[i + len("\\boxed{"):j - 1] if depth == 0 else None
 
 
-def extract_all_candidates(text: str) -> list[str]:
-    """Every answer-shaped span, best first, for diagnostics."""
+def extract_all_candidates(text: str, prefer: str = "requested") -> list[str]:
+    """Every answer-shaped span, best first, for diagnostics.
+
+    ``prefer`` selects which convention wins when a text carries both:
+
+    * ``"requested"`` -- the ``ANSWER:`` line, for a *model generation*, where
+      that line is what the prompt asked for.
+    * ``"boxed"`` -- ``\boxed{}``, for a *reference solution*, where boxing
+      the result is the convention and an ``ANSWER:`` prefix may wrap the whole
+      prose derivation.
+
+    The distinction is not cosmetic. MATH-500's gold is literally
+    ``"ANSWER: " + solution`` (``tasks/tasks/math_500.py:47``), so preferring
+    the requested line on a gold captures the solution's *first line* -- a
+    paragraph of derivation -- instead of the answer boxed at its end.
+    """
     out: list[str] = []
     after = text.split(_THINK_CLOSE)[-1] if _THINK_CLOSE in text else text
     for scope in (after, text):
+        answer_line = None
         matches = list(_ANSWER_LINE.finditer(scope))
         if matches:
-            out.append(matches[-1].group("a").strip())
+            answer_line = matches[-1].group("a").strip()
         boxed = _last_boxed(scope)
-        if boxed is not None:
-            out.append(boxed.strip())
+        boxed = boxed.strip() if boxed is not None else None
+        ordered = ((boxed, answer_line) if prefer == "boxed"
+                   else (answer_line, boxed))
+        out.extend(x for x in ordered if x)
         envs = list(_LATEX_ENV.finditer(scope))
         if envs:
             groups = [g for g in envs[-1].groupdict().values() if g]
@@ -110,7 +127,7 @@ def extract_all_candidates(text: str) -> list[str]:
     return unique
 
 
-def extract_final_answer(text: str) -> str | None:
+def extract_final_answer(text: str, prefer: str = "requested") -> str | None:
     """The span a grader should compare, or None if the answer is not stated.
 
     Priority, and the reasons for this order rather than LightEval's:
@@ -129,10 +146,16 @@ def extract_final_answer(text: str) -> str | None:
     Trailing punctuation is stripped because "ANSWER: 42." is the same answer
     as "ANSWER: 42"; nothing else about the span is altered.
     """
-    candidates = extract_all_candidates(text)
+    candidates = extract_all_candidates(text, prefer)
     if not candidates:
         return None
     answer = candidates[0]
+    # A span the length of a paragraph is a derivation, not an answer. This
+    # only fires when the preferred convention picked up prose -- the boxed
+    # fallback below then gets its turn -- and the threshold is generous
+    # enough that no real answer reaches it.
+    if len(answer) > 160 and len(candidates) > 1:
+        answer = candidates[1]
     answer = answer.strip().rstrip(".").strip()
     # A model that writes "ANSWER: \boxed{42}" gets unwrapped to the value.
     inner = _last_boxed(answer)
@@ -204,6 +227,33 @@ def _bracket_kinds_conflict(gold: str, pred: str) -> bool:
     if not g_match or not p_match:
         return False
     return _BRACKET_KIND[g_match.group(1)] != _BRACKET_KIND[p_match.group(1)]
+
+
+# Unicode maths that latex2sympy cannot parse, mapped to the LaTeX spelling
+# it can. This is transliteration, not normalisation: each character has one
+# unambiguous LaTeX equivalent, and no bracket, separator or grouping is
+# touched. Found by auditing what a real run still scored wrong -- the corpus
+# had "288\pi" against "288π", which happens to parse, and so missed that
+# "2√113" against "2\sqrt{113}" does not.
+_UNICODE_MATH = (
+    ("\u2212", "-"), ("\u00b7", "\\cdot "), ("\u00d7", "\\times "),
+    ("\u00f7", "/"), ("\u2264", "\\le "), ("\u2265", "\\ge "),
+    ("\u2260", "\\ne "), ("\u00b1", "\\pm "), ("\u221e", "\\infty "),
+    ("\u222a", "\\cup "), ("\u2229", "\\cap "), ("\u2208", "\\in "),
+    ("\u03c0", "\\pi "), ("\u03b8", "\\theta "), ("\u03bb", "\\lambda "),
+    ("\u03b1", "\\alpha "), ("\u03b2", "\\beta "), ("\u03bc", "\\mu "),
+)
+# A radical needs its argument braced: "\sqrt113" is not "\sqrt{113}".
+_UNICODE_ROOT = re.compile(r"\u221a\s*(\{[^{}]*\}|\([^()]*\)|[0-9]+(?:\.[0-9]+)?|[A-Za-z])")
+
+
+def _transliterate(value: str) -> str:
+    """Rewrite unicode maths as LaTeX so the parser gets a chance at it."""
+    out = _UNICODE_ROOT.sub(
+        lambda m: "\\sqrt{" + m.group(1).strip("(){}") + "}", value)
+    for char, latex in _UNICODE_MATH:
+        out = out.replace(char, latex)
+    return out
 
 
 _TARGETS_CACHE: list | None = None
@@ -281,6 +331,7 @@ def answers_equivalent(gold: str, pred: str, precision: int = 6,
     targets = _extraction_targets()
 
     def parsed(value: str):
+        value = _transliterate(value)
         # The extractor expects a generation, not a bare answer, so give it
         # one in the shape its highest-priority pattern recognises. Wrapping
         # in \boxed first is what makes a bare "1/2" parse at all: the

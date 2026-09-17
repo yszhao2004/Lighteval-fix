@@ -69,6 +69,15 @@ EQUIVALENT = [
     (r"12\pi", "12π"),
     (r"\frac{\pi}{6}", "π/6"),
     (r"-\frac{\pi}{6}", "-π/6"),
+    # Unicode maths the parser cannot read, against its LaTeX spelling. Every
+    # one of these was a false rejection on a real run before transliteration
+    # was added; the synthetic corpus had only "288\\pi" vs "288π", which
+    # happens to parse and so hid the gap.
+    (r"2\sqrt{113}", "2√113"),
+    (r"16 \sqrt{3}", "16√3"),
+    (r"11 \sqrt{5} + 11", "11(√5+1)"),
+    (r"(-\infty, 2) \cup (3, \infty)", "(-∞,2)∪(3,∞)"),
+    (r"1 \pm \sqrt{19}", "1 ± √19"),
     # Radicals, simplified or not.
     (r"2\sqrt{3}", r"\sqrt{12}"),
     (r"\sqrt{66}", "sqrt(66)"),

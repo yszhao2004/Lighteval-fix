@@ -289,7 +289,61 @@ on a guess is not.
 
 ---
 
-## 5. Re-grading a finished run
+## 5. What validating against real runs changed
+
+The 66-case corpus was green before any of this repository's code had been
+pointed at an actual evaluation. Running `tools/regrade.py` against the details
+files of finished runs found two defects the synthetic cases could not:
+
+**The gold needed the opposite extraction rule from the prediction.** MATH-500's
+gold is literally `"ANSWER: " + solution` (`tasks/tasks/math_500.py:47`), so
+preferring the requested `ANSWER:` line — right for a generation — captured the
+*first line of the derivation* instead of the answer boxed at its end. One gold
+came out as a 500-character paragraph. Extraction is now side-aware:
+`extract_final_answer(text, prefer="boxed")` for a reference solution,
+`prefer="requested"` for a generation, plus a length guard so a paragraph is
+never accepted as an answer. Before the fix the re-grader recovered *fewer*
+items than a crude hand-written normaliser; after it, more.
+
+**Unicode maths was silently unparseable.** `288\pi` against `288π` happens to
+parse, and the corpus contained exactly that case — so it hid the fact that
+`2\sqrt{113}` against `2√113`, `16\sqrt{3}` against `16√3`, and
+`(-\infty,2)\cup(3,\infty)` against `(-∞,2)∪(3,∞)` all failed. `_transliterate`
+now rewrites unicode maths into its LaTeX spelling before parsing. This is
+transliteration, not normalisation: every character mapped has one unambiguous
+LaTeX equivalent, and no bracket, separator or grouping is touched. The five
+real cases are now in the corpus.
+
+**Agreement as evidence.** On GPQA the re-grader's verdicts match an
+independently written checker on every cell tested — same recovered counts,
+same residual. The two implementations share no code and disagree in method
+(one defers to LightEval's symbolic comparator, the other used a hand-written
+normaliser), so agreement is not an artefact of either.
+
+### What the residual looks like, and why it is left alone
+
+After both fixes a small number of items are still scored wrong, and they fall
+into classes that a comparator cannot settle by itself:
+
+| class | example (gold vs prediction) |
+|---|---|
+| genuinely wrong | `2\sqrt{113}` vs `2\sqrt{106}` |
+| units appended | `12\pi` vs `12π inches per second` |
+| mixed number | `137 \frac{1}{2}` vs `137 1/2` (which parses as 137 × ½) |
+| `±` expanded to a list | `1 \pm \sqrt{19}` vs `1 - sqrt(19), 1 + sqrt(19)` |
+| more roots than the gold lists | `3 \pm 2\sqrt{2}` vs four explicit values |
+| column vector vs tuple | `\begin{pmatrix}-18\\-49\\96\end{pmatrix}` vs `(-18, -49, 96)` |
+| interval vs inequality with a named variable | `(3,4]` vs `3 < λ ≤ 4` |
+
+Each of these needs either the question text (are units expected? was the
+answer meant to list every root?) or a judgement about notation
+(is `137 1/2` a mixed number or a product?). Accepting them would mean
+guessing, and a grader that guesses in the model's favour is worse than one
+that is merely strict. They are recorded here instead.
+
+---
+
+## 6. Re-grading a finished run
 
 Scoring can be redone from the details files, offline, without the model:
 
@@ -307,7 +361,7 @@ reading diffs.
 
 ---
 
-## 6. Layout
+## 7. Layout
 
 ```
 lighteval_fix/
@@ -318,7 +372,7 @@ tools/regrade.py     re-score a finished run from its details files
 tests/               the corpus: extraction, equivalence, and the LCB rewrite
 ```
 
-## 7. Limitations
+## 8. Limitations
 
 * The line numbers are `6ba40c4`. Upstream moves; `patches/` will need
   refreshing, and the modules under `lighteval_fix/` are written to fail

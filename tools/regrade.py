@@ -109,7 +109,13 @@ def main(argv=None) -> int:
             passed += 1
             continue
         doc = _as_dict(data["doc"][i]) or {}
-        gold = extract_final_answer(_gold_text(doc)) or _gold_text(doc).strip()
+        # prefer="boxed" on the gold: LightEval's math golds are whole worked
+        # solutions prefixed with "ANSWER: ", so the requested-format rule that
+        # is right for a generation captures the first line of the derivation
+        # here. Found by running this against real details files, not by the
+        # synthetic corpus.
+        gold = (extract_final_answer(_gold_text(doc), prefer="boxed")
+                or _gold_text(doc).strip())
         pred = extract_final_answer(_prediction_text(data["model_response"][i]))
         if not gold or pred is None:
             unreadable += 1
