@@ -14,7 +14,7 @@ indistinguishable, from the outside, from the model being worse.
 |---|---|---|---|
 | MATH-500 answer extraction | the requested `ANSWER:` line is read only inside math delimiters and is outranked by `\boxed`; no string-answer target | **confirmed from source** | re-grader + extraction module |
 | LiveCodeBench stdin execution | candidate program is rewritten before execution | **minimal reproduction** | re-grader + upstream patch |
-| GPQA letter extraction | a `final answer … is X` phrase in the reasoning outranks the answer line | **confirmed on real runs** | upstream patch 0003 + re-grader |
+| GPQA letter extraction | a `final answer … is X` phrase in the reasoning outranks the answer line; `Answer: $X`, the template copied literally, is not read | **confirmed on real runs** | upstream patches 0003 + 0004 + re-grader |
 | AIME answer extraction | the prompt's own format template, restated while reasoning, outranks the answer | **minimal reproduction** | upstream patch 0002 + re-grader rule |
 | Reasoning removal | does nothing when the chat template opens `<think>` in the prompt, so all of the above search the reasoning | **minimal reproduction** | upstream patch 0003 |
 | Run-killing harness faults | three separate ones, §8 | **confirmed from source** | import-time patches |
@@ -353,9 +353,28 @@ that do exist are a 2 s one around writing to `doc.specific`
 plain string compare (`math_comparison.py:595-601`). Extraction on the
 generations above takes milliseconds.
 
-What ships: patch 0003 (§5) makes the reasoning removal work, which removes
-these phrases before extraction, and `tools/regrade.py` re-extracts every item
-from its final answer and reports the disagreements.
+A second, smaller failure comes from the prompt itself. The template is
+`Answer: $LETTER`, and some models copy the dollar sign: `Answer: $C` or
+`Answer: $C$`. The letter patterns want a space or the start of the text
+immediately before the letter (`answer_prefix_re`, line 301), so the
+requested line is not read at priority 100 and a weaker pattern elsewhere in
+the text decides the grade. Such an answer is scored correctly only when the
+same letter happens to be what the weaker pattern finds.
+
+What ships:
+
+* **Patch 0003** (§5) makes the reasoning removal work, which removes the
+  phrases above before extraction.
+* **Patch 0004** (`patches/0004-indices-accept-dollar-wrapped-letter.patch`)
+  lets the letter patterns take an optional `$` on either side of the letter.
+  On every GPQA run available (33 runs, 6,534 items) it changes only items
+  whose last line was `Answer: $X`, all from 0 to 1. It matters most
+  together with 0003: once the reasoning is removed, a copied template can no
+  longer be rescued by a letter in the reasoning, so 0003 without 0004 turns
+  correct `Answer: $C` answers into zeros. `tests/test_letter_dollar_patch.py`
+  applies it to a copy of the installed extractor.
+* `tools/regrade.py` re-extracts every item from its final answer and reports
+  the disagreements.
 
 ---
 
@@ -450,7 +469,8 @@ It was validated on the same runs plus every GPQA run: 118 runs and 17,846
 items, on which the unpatched implementation reproduces every recorded
 score.
 
-* **GPQA and AIME.** Grades now follow the stated final answer. The misreads
+* **GPQA and AIME.** Grades now follow the stated final answer, provided
+  0004 is applied as well on GPQA (§4). The misreads
   of §4 and the template misreads above are corrected. Some items also move
   from 1 to 0, and those are corrections too. A few had been credited
   through a phrase in the reasoning while the stated answer was a different,
@@ -652,6 +672,6 @@ patches/             upstream diffs against lighteval 6ba40c4
 tools/
   regrade.py         re-score answers from a finished run's details
   regrade_lcb.py     re-run LiveCodeBench stdin candidates and re-score
-tests/               extraction, equivalence, the LCB rewrite, patches 0002
-                     and 0003, the harness
+tests/               extraction, equivalence, the LCB rewrite, patches
+                     0002-0004, the harness
 ```

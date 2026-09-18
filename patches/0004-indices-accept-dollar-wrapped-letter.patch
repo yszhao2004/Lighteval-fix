@@ -1,0 +1,17 @@
+diff --git a/src/lighteval/metrics/utils/extractive_match_utils.py b/src/lighteval/metrics/utils/extractive_match_utils.py
+index da0d718d..82c15cfe 100644
+--- a/src/lighteval/metrics/utils/extractive_match_utils.py
++++ b/src/lighteval/metrics/utils/extractive_match_utils.py
+@@ -298,8 +298,10 @@ def lazy_indices_regex(
+     colon_re = rf"[{re.escape(translation_literal.colon)}\:]"
+     space_re = re.escape(translation_literal.sentence_space)
+ 
+-    answer_prefix_re = rf"(?:^|{space_re})(?:\*\*)?"
+-    answer_suffix_re = rf"(?:\*\*)?(?:{full_stop_re}|{comma_re}|\s?{colon_re}|{space_re}|$)"
++    # "\$?": the gpqa prompt's own template is "Answer: $LETTER", and some models
++    # copy it literally ("Answer: $C", "Answer: $C$").
++    answer_prefix_re = rf"(?:^|{space_re})(?:\*\*)?\$?"
++    answer_suffix_re = rf"\$?(?:\*\*)?(?:{full_stop_re}|{comma_re}|\s?{colon_re}|{space_re}|$)"
+     answer_re = f"{answer_prefix_re}{indice_str_re}{answer_suffix_re}"
+     answer_re_start = rf"^(?:\*\*)?{indice_str_re}{answer_suffix_re}"
+     answer_re_line_start = rf"\n(?:\*\*)?{indice_str_re}{answer_suffix_re}"
