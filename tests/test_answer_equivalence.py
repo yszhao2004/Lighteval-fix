@@ -47,6 +47,19 @@ EXTRACTION = [
     ("<think>guess \\boxed{5}</think>\n\nANSWER: 6", "6"),
     # Nothing answer-shaped at all.
     ("I am not sure how to proceed.", None),
+    # A restated format template is not an answer. A generation cut off
+    # before </think> is searched whole, so an echo written after the real
+    # answer must not win -- in a box, an answer line, or a latex environment.
+    (r"so the result is \boxed{321}. The format wants: Therefore, the final "
+     r"answer is: $\boxed{ANSWER}$. I hope it is correct", "321"),
+    ("value is 7.\nANSWER: 7\nThe last line must be:\nANSWER: $ANSWER", "7"),
+    ("Answer: B\nThe required format is\nAnswer: $LETTER", "B"),
+    # A template and nothing else is no answer at all.
+    (r"The last line should read $\boxed{ANSWER}$.", None),
+    # Only the two template words are skipped: a single letter is a real
+    # answer, and a box carrying a value next to the word is read as it is.
+    (r"\boxed{A}", "A"),
+    (r"\boxed{\text{Answer: 5}}", r"\text{Answer: 5}"),
 ]
 
 
@@ -162,6 +175,12 @@ END_TO_END = [
     (r"\boxed{(15,-29)}", "ANSWER: (15,-29)", True),
     (r"\boxed{(15,-29)}", "ANSWER: (-29,15)", False),
     (r"\boxed{\frac{1}{2}}", "<think>...</think>\n\nANSWER: 0.5", True),
+    # The AIME shape: the template is restated inside the thinking block, the
+    # answer follows it in the requested form.
+    (r"\boxed{321}", "The last line should be: 'Therefore, the final answer is: "
+                      "$\\boxed{ANSWER}$. I hope it is correct'. ... so it is 321.\n"
+                      "</think>\nTherefore, the final answer is: \\boxed{321}. "
+                      "I hope it is correct", True),
 ]
 
 

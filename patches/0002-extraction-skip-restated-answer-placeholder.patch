@@ -1,0 +1,49 @@
+diff --git a/src/lighteval/metrics/utils/extractive_match_utils.py b/src/lighteval/metrics/utils/extractive_match_utils.py
+index da0d718..4bf9466 100644
+--- a/src/lighteval/metrics/utils/extractive_match_utils.py
++++ b/src/lighteval/metrics/utils/extractive_match_utils.py
+@@ -560,6 +560,34 @@ def extract_match(
+         return extract_indices(match, target_type, timeout_seconds=timeout_seconds)
+ 
+ 
++# The words prompts use as the answer slot in their own format template:
++# "Therefore, the final answer is: $\boxed{ANSWER}$. I hope it is correct"
++# (aime) and "Answer: $LETTER" (gpqa). A model that restates the template while
++# it reasons writes these back verbatim, and the "final answer is ... I hope"
++# pattern below is priority 0 -- it matches the restatement before any real
++# answer is tried. "ANSWER" also parses as the product A*E*N*R*S*W, so without
++# this check the placeholder is accepted as the prediction.
++_ANSWER_PLACEHOLDERS = frozenset({"answer", "letter"})
++
++
++def _is_answer_placeholder(match: re.Match) -> bool:
++    """True if every answer span a match captured is the prompt's placeholder.
++
++    Latex commands, dollar signs, braces and whitespace are ignored, so
++    ``\\boxed{ANSWER}`` and ``\\text{ANSWER}`` both count; any other content
++    -- a digit, a real letter answer such as ``A`` -- makes it a real answer.
++    """
++    spans = [value for value in match.groupdict().values() if value is not None]
++    if not spans:
++        return False
++
++    def core(text: str) -> str:
++        text = re.sub(r"\\[A-Za-z]+", "", text)
++        return re.sub(r"[\s${}\\]", "", text).lower()
++
++    return all(core(span) in _ANSWER_PLACEHOLDERS for span in spans)
++
++
+ def extract_target_from_pred(
+     pred: str,
+     target_res: list[tuple[list[tuple[re.Pattern[str], int]], ExtractionTarget]],
+@@ -609,6 +637,9 @@ def extract_target_from_pred(
+ 
+         # Try to extract from each match, starting from rightmost
+         for match, _, _, target_type in matches_with_pos:
++            # A restated format template is not an answer; keep looking.
++            if _is_answer_placeholder(match):
++                continue
+             extracted_match, str_fallback = extract_match(match, target_type, timeout_seconds)
+             match_found = True
+ 

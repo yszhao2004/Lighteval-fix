@@ -15,7 +15,8 @@ indistinguishable, from the outside, from the model being worse.
 | MATH-500 answer extraction | requested format outranked by `\boxed`; no string-answer target | **confirmed from source** | re-grader + extraction module |
 | LiveCodeBench stdin execution | candidate program is rewritten before execution | **minimal reproduction** | re-grader + upstream patch |
 | GPQA letter extraction | unknown | **not diagnosed** | re-grader only |
-| Run-killing harness faults | three separate ones, §7 | **confirmed from source** | import-time patches |
+| AIME answer extraction | the prompt's own format template, restated while reasoning, outranks the answer | **minimal reproduction** | upstream patch + re-grader rule |
+| Run-killing harness faults | three separate ones, §8 | **confirmed from source** | import-time patches |
 
 Two independent halves, and which you need depends on what you are doing:
 
@@ -24,7 +25,7 @@ Two independent halves, and which you need depends on what you are doing:
   correction is a script anyone can rerun on the same artefacts.
 * **Running new evaluations** (`lighteval_fix.harness`) — install before
   LightEval's model modules import, so a run is not lost to a logging crash or
-  silently sampled differently than configured. See §7.
+  silently sampled differently than configured. See §8.
 
 Everything is verified by a test corpus that runs offline, with no model and no
 GPU. This repository contains no accuracy figures for any model: it ships the
@@ -117,8 +118,9 @@ Solve the following problem. The final line of your response MUST be of the foll
 ```
 
 So the model is instructed to end with `ANSWER: <value>`. No `\boxed{}` is
-requested. (The AIME tasks *do* mandate boxing — `tasks/tasks/aime.py:43` —
-which is why this only bites MATH-500 and tasks like it.)
+requested. (The AIME tasks *do* mandate boxing — `tasks/tasks/aime.py:45` —
+which is why this inversion only bites MATH-500 and tasks like it. AIME fails
+differently; see §5.)
 
 ### What the metric accepts
 
@@ -320,7 +322,106 @@ on a guess is not.
 
 ---
 
-## 5. What validating against real runs changed
+## 5. AIME: the prompt's own template is graded as the answer
+
+### What the task asks for
+
+`src/lighteval/tasks/tasks/aime.py:45`:
+
+> The last line of your response should be of the following format:
+> 'Therefore, the final answer is: $\boxed{ANSWER}$. I hope it is correct'
+> (without quotes) where ANSWER is just the final number or expression that
+> solves the problem.
+
+### What the extractor does with it
+
+The highest-priority pattern, priority 0, is that same sentence wrapped around
+a LaTeX environment (`metrics/utils/extractive_match_utils.py:250-252`):
+
+```python
+final_answer_prefixed_re = rf"(?i:final answer is)\:?\s*{latex_re}\.?\s?I hope"
+```
+
+Within a priority tier, matches are tried rightmost first and the first one
+that parses ends the search (lines 607-611).
+
+Some reasoning models restate the instruction while they think: "the last
+line should be: 'Therefore, the final answer is: $\boxed{ANSWER}$. I hope it
+is correct'". The restatement carries the `$…$` delimiters, so it matches the
+priority-0 pattern. The model's own last line often does not: `\boxed{321}`
+or `\(\boxed{321}\)` without the dollar signs falls to a lower tier. So the
+restatement wins, and it parses, because sympy reads `ANSWER` as the product
+`A·E·N·R·S·W`. Nothing else is tried, and the item scores zero with the
+correct answer written as the last line.
+
+### Why the reasoning is searched at all
+
+LightEval does remove reasoning before grading. `remove_reasoning_tags` is on
+by default with the pair `('<think>', '</think>')` (`pipeline.py:93-94`), it
+is applied in `_post_process_outputs` (`pipeline.py:351-358`), and the metric
+reads `final_text`, which returns the post-processed text
+(`models/model_output.py:142-144`). But the removal loop is
+`while start_tag in result and end_tag in result` (`utils/utils.py:308-309`),
+so it needs both tags in the generation. Current reasoning models' chat
+templates put `<think>` at the end of the prompt, so the generation holds only
+`</think>`. Nothing is removed, nothing is logged, and extraction runs over
+the whole trace.
+
+### Why the patch does not fix the reasoning removal instead
+
+Removing everything up to a lone `</think>` is the obvious fix, and on AIME it
+corrects the same items. On MATH-500 it is not safe by itself. The reasoning
+it removes is what currently rescues final answers LightEval cannot parse
+(`ANSWER: 2k+2` without delimiters, `\boxed{ANSWER: 6}`), because a matching
+value earlier in the trace gets graded instead. Removal alone therefore
+swaps one set of wrong grades for another until the extraction problems in §2
+are fixed too. The re-grader here fixes both together (§2). The upstream
+patch is limited to the failure itself.
+
+### The patch
+
+`patches/0002-extraction-skip-restated-answer-placeholder.patch` makes
+`extract_target_from_pred` skip a match when every span it captured is a
+template word: `ANSWER` (AIME and the `ANSWER: $ANSWER` family) or `LETTER`
+(GPQA's `Answer: $LETTER`). The check ignores LaTeX commands, `$`, braces and
+whitespace. Anything else in the span is kept, whether a digit, a real letter
+answer such as `A`, or `\text{Answer: 5}`. Priorities, ordering and parsing
+are untouched, so a generation that restates no template is graded exactly as
+upstream grades it.
+
+One consequence is stated rather than hidden. If a generation is cut off
+before `</think>`, the patched extractor falls through to whatever LightEval
+would have taken without the restatement, which can be a value inside the
+reasoning. That is LightEval's existing rule for truncated generations. The
+patch does not add it.
+
+`tests/test_aime_template_patch.py` applies the patch to a copy of the
+installed extractor. It checks the minimal reproduction under both versions,
+a text holding only the template, a text with no template (unchanged), and
+GPQA letters.
+
+**Validated against real runs.** The patch was run over every AIME and
+MATH-500 details file available, 85 runs and 11,010 items across nine models.
+There, the unpatched extractor, called the way `pass_at_k_math` calls it,
+reproduces every recorded per-item score. With the patch, the only changes
+are from 0 to 1, all on items whose extracted span had been the placeholder,
+and no item goes from 1 to 0. In the changed items the model had written the
+correct final answer after `</think>`, except for a few generations cut off
+at the token limit, which were graded under the truncation rule above. The
+restatement came from Qwen3.8-Flash-Next, in unquantized and quantized runs
+alike, and from both GLM models. It is a model habit, not a property of a
+checkpoint.
+
+### The re-grader
+
+`lighteval_fix.extraction` applies the same rule in all three places it looks
+for an answer: `\boxed{}`, the `ANSWER:` line, and the LaTeX-environment
+fallback. A generation cut off before `</think>` with a restated template
+after its last real answer is therefore still read at the answer.
+
+---
+
+## 6. What validating against real runs changed
 
 The 66-case corpus was green before any of this repository's code had been
 pointed at an actual evaluation. Running `tools/regrade.py` against the details
@@ -374,7 +475,7 @@ that is merely strict. They are recorded here instead.
 
 ---
 
-## 6. Re-grading a finished run
+## 7. Re-grading a finished run
 
 Scoring can be redone from the details files, offline, without the model:
 
@@ -392,7 +493,7 @@ reading diffs.
 
 ---
 
-## 7. Faults that end a run before grading
+## 8. Faults that end a run before grading
 
 Not extraction, but the first things to hit in a new environment. `harness.py`
 installs all three; each raises if the upstream shape it depends on changed,
@@ -435,7 +536,7 @@ leaves a forwarding shim rather than editing a package we do not own.
 
 ---
 
-## 8. What an upstream MATH-500 fix would have to change
+## 9. What an upstream MATH-500 fix would have to change
 
 The correction here is delivered by re-grading, not as a patch to
 `patches/`, and that is a deliberate choice rather than an omission. Fixing it
@@ -460,7 +561,7 @@ stands behind.
 
 ---
 
-## 9. Limitations
+## 10. Limitations
 
 * The line numbers are `6ba40c4`. Upstream moves; `patches/` will need
   refreshing, and the modules under `lighteval_fix/` are written to fail
@@ -469,21 +570,25 @@ stands behind.
   semantic one. `"an ellipse"` and `"ellipse"` are different strings and will
   be reported as different answers.
 * GPQA is undiagnosed. See §4.
+* The template words are exactly two, `ANSWER` and `LETTER`. A task whose
+  template names its slot differently needs the word added to both the patch
+  and `extraction.py`.
 * The LCB rewrite is shown to break one class of program, not all of them.
   See §3.
 
 ---
 
-## 10. Layout
+## 11. Layout
 
 ```
 lighteval_fix/
   extraction.py      answer extraction + equivalence (MATH-500 and friends)
   lcb_stdin.py       run a stdin candidate as written, compare its output
-  harness.py         the three run-killing faults of §7
+  harness.py         the three run-killing faults of §8
 patches/             upstream diffs against lighteval 6ba40c4
 tools/
   regrade.py         re-score answers from a finished run's details
   regrade_lcb.py     re-run LiveCodeBench stdin candidates and re-score
-tests/               extraction, equivalence, the LCB rewrite, the harness
+tests/               extraction, equivalence, the LCB rewrite, the AIME
+                     template patch, the harness
 ```

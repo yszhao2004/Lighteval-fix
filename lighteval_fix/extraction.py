@@ -68,20 +68,57 @@ _LATEX_ENV = re.compile(
     re.S)
 
 
+# The template words the prompts themselves use for the answer slot:
+# "ANSWER: $ANSWER" (math_500, the AIME family) and "Answer: $LETTER" (gpqa).
+# A box holding one of these is the model echoing the instruction back, never
+# an answer. Deliberately only these two words: a single letter such as "A" is
+# a real GPQA answer, and "x" or "even" are real MATH answers.
+_PLACEHOLDERS = frozenset({"answer", "letter"})
+
+
+def _is_placeholder(content: str) -> bool:
+    """True if a box holds the prompt's format placeholder rather than a value.
+
+    Latex commands (``\\text``, ``\\mathrm``) and the ``$``, braces and
+    whitespace around the word are ignored, so ``\\boxed{\\text{ANSWER}}`` and
+    ``\\boxed{$ANSWER}`` both count. Everything else is kept, so a box that
+    carries a value next to the word -- ``\\boxed{\\text{Answer: 5}}`` -- does
+    not match and is read as the answer it contains.
+    """
+    core = re.sub(r"\\[A-Za-z]+", "", content)
+    core = re.sub(r"[\s${}\\]", "", core)
+    return core.lower() in _PLACEHOLDERS
+
+
 def _last_boxed(text: str) -> str | None:
-    """The last ``\\boxed{...}``, brace-matched.
+    """The last ``\\boxed{...}`` that holds a real answer, brace-matched.
 
     A regex cannot do this: MATH answers nest braces (``\\boxed{\\frac{a}{b}}``)
     and a greedy or lazy pattern gets either too much or too little.
+
+    A box holding the prompt's own format placeholder is skipped and the search
+    continues leftward. Some models restate the instruction while they reason,
+    writing a literal ``$\\boxed{ANSWER}$`` next to their real answers. Echoes
+    inside the thinking block are already out of reach of the
+    post-``</think>`` rule in ``extract_all_candidates``, but a generation cut
+    off before ``</think>`` is searched over its whole text, and there an echo
+    written after the real answer would be the rightmost box.
     """
-    i = text.rfind("\\boxed{")
-    if i < 0:
-        return None
-    j, depth = i + len("\\boxed{"), 1
-    while j < len(text) and depth:
-        depth += (text[j] == "{") - (text[j] == "}")
-        j += 1
-    return text[i + len("\\boxed{"):j - 1] if depth == 0 else None
+    end = len(text)
+    while True:
+        i = text.rfind("\\boxed{", 0, end)
+        if i < 0:
+            return None
+        j, depth = i + len("\\boxed{"), 1
+        while j < len(text) and depth:
+            depth += (text[j] == "{") - (text[j] == "}")
+            j += 1
+        if depth != 0:
+            return None
+        content = text[i + len("\\boxed{"):j - 1]
+        if not _is_placeholder(content):
+            return content
+        end = i
 
 
 def extract_all_candidates(text: str, prefer: str = "requested") -> list[str]:
@@ -104,7 +141,10 @@ def extract_all_candidates(text: str, prefer: str = "requested") -> list[str]:
     after = text.split(_THINK_CLOSE)[-1] if _THINK_CLOSE in text else text
     for scope in (after, text):
         answer_line = None
-        matches = list(_ANSWER_LINE.finditer(scope))
+        # "ANSWER: $ANSWER" and "Answer: $LETTER" restated from the prompt are
+        # the template, not an answer line.
+        matches = [m for m in _ANSWER_LINE.finditer(scope)
+                   if not _is_placeholder(m.group("a"))]
         if matches:
             answer_line = matches[-1].group("a").strip()
         boxed = _last_boxed(scope)
@@ -112,11 +152,11 @@ def extract_all_candidates(text: str, prefer: str = "requested") -> list[str]:
         ordered = ((boxed, answer_line) if prefer == "boxed"
                    else (answer_line, boxed))
         out.extend(x for x in ordered if x)
-        envs = list(_LATEX_ENV.finditer(scope))
+        envs = [g for m in _LATEX_ENV.finditer(scope)
+                for g in [next((v for v in m.groupdict().values() if v), None)]
+                if g and not _is_placeholder(g)]
         if envs:
-            groups = [g for g in envs[-1].groupdict().values() if g]
-            if groups:
-                out.append(groups[0].strip())
+            out.append(envs[-1].strip())
         if out:
             break
     seen, unique = set(), []
