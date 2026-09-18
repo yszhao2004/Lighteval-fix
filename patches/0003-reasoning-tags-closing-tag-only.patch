@@ -1,0 +1,18 @@
+diff --git a/src/lighteval/utils/utils.py b/src/lighteval/utils/utils.py
+index 3ab5976d..ccaae14c 100644
+--- a/src/lighteval/utils/utils.py
++++ b/src/lighteval/utils/utils.py
+@@ -306,6 +306,13 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
+     result = text
+ 
+     for start_tag, end_tag in tag_pairs:
++        # Chat templates of reasoning models often open the block in the prompt
++        # ("<|assistant|><think>"), so the generation carries only the closing
++        # tag. Everything before a closing tag that has no opening tag ahead of
++        # it is then reasoning too.
++        end = result.find(end_tag)
++        if end != -1 and start_tag not in result[:end]:
++            result = result[end + len(end_tag) :]
+         while start_tag in result and end_tag in result:
+             start = result.find(start_tag)
+             end = result.find(end_tag, start)

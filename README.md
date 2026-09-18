@@ -12,10 +12,11 @@ indistinguishable, from the outside, from the model being worse.
 
 | Area | Cause | Confidence | What ships |
 |---|---|---|---|
-| MATH-500 answer extraction | requested format outranked by `\boxed`; no string-answer target | **confirmed from source** | re-grader + extraction module |
+| MATH-500 answer extraction | the requested `ANSWER:` line is read only inside math delimiters and is outranked by `\boxed`; no string-answer target | **confirmed from source** | re-grader + extraction module |
 | LiveCodeBench stdin execution | candidate program is rewritten before execution | **minimal reproduction** | re-grader + upstream patch |
-| GPQA letter extraction | unknown | **not diagnosed** | re-grader only |
-| AIME answer extraction | the prompt's own format template, restated while reasoning, outranks the answer | **minimal reproduction** | upstream patch + re-grader rule |
+| GPQA letter extraction | a `final answer … is X` phrase in the reasoning outranks the answer line | **confirmed on real runs** | upstream patch 0003 + re-grader |
+| AIME answer extraction | the prompt's own format template, restated while reasoning, outranks the answer | **minimal reproduction** | upstream patch 0002 + re-grader rule |
+| Reasoning removal | does nothing when the chat template opens `<think>` in the prompt, so all of the above search the reasoning | **minimal reproduction** | upstream patch 0003 |
 | Run-killing harness faults | three separate ones, §8 | **confirmed from source** | import-time patches |
 
 Two independent halves, and which you need depends on what you are doing:
@@ -139,7 +140,7 @@ candidate patterns by priority and **the lowest number wins**
 | `answer` + value | 200 |
 | bare expression / latex env | 300 |
 
-Two consequences:
+Three consequences:
 
 1. **A `\boxed{}` anywhere outranks the requested final line.** A reasoning
    model that boxes a candidate mid-derivation and then writes the requested
@@ -157,8 +158,29 @@ Two consequences:
 
    MATH-500 contains such answers (`even`, `ellipse`, a person's name, a
    multiple-choice letter). They score zero whatever the model writes.
+3. **The requested line is read only inside math delimiters.** The `answer:`
+   pattern (lines 256-259) wraps `latex_envs_re`, which is `$…$`, `$$…$$`,
+   `\(…\)`, `\[…\]` or ` [ … ] ` (lines 210-218); the only bare form it
+   accepts is a numeric `\frac{a}{b}` (lines 219-221). In the prompt,
+   `$ANSWER` is a placeholder, and models write the value bare. The
+   expression target (`lazy_expr_regex`, lines 101-123) then reads a leading
+   number, or nothing. LightEval's own extractor, on single lines:
 
-A third, quieter one: the gold for this task is the **entire worked solution**
+   | generation | extracted |
+   |---|---|
+   | `ANSWER: -\sqrt{3}` | nothing |
+   | `ANSWER: \pi` | nothing |
+   | `ANSWER: 3R^2` | `3` |
+   | `ANSWER: 288\pi` | `288` |
+   | `ANSWER: $3R^2$` | `3R^2` |
+   | `then 7 apples.` / `ANSWER: \sqrt{66}` | `7` |
+
+   When the line yields nothing, another number or box anywhere in the text
+   is taken instead, including one inside the reasoning, which is not
+   removed (§5). This is how a grade can compare the gold against a span the
+   model never offered as its answer.
+
+A last, quieter one: the gold for this task is the **entire worked solution**
 prefixed with `ANSWER: ` (`math_500.py:44-49`,
 `choices=[f"ANSWER: {line['solution']}"]`), so gold extraction is itself
 searching prose for the answer, and falls back to the raw solution string when
@@ -289,36 +311,51 @@ cause; `extract_code` taking the text between the *last two* fences
 
 ---
 
-## 4. GPQA: a verifier, because the cause is not known
+## 4. GPQA: a phrase in the reasoning outranks the answer line
 
 GPQA answers are single letters, extracted with
 `IndicesExtractionConfig(prefix_for_extraction="NativeLetters",
-try_extract_without_anchor=True)` (`metrics/metrics.py:607-619`).
+try_extract_without_anchor=True)` (`metrics/metrics.py:607-619`). The letter
+patterns are ranked the same way as the maths ones
+(`metrics/utils/extractive_match_utils.py:311-341`), lowest number first:
 
-Long generations that end with a clean `Answer: X` are sometimes scored zero.
-The mechanism is **not** the one usually blamed. The `timeout_seconds=5`
-default (`metrics/dynamic_metrics.py:165`) is never consumed on this path:
-`extract_indices` (`extractive_match_utils.py:531-537`) is a regex group
-lookup with no sympy parsing and does not take a timeout. The alarms that do
-exist are a 2 s one around writing to `doc.specific` (`dynamic_metrics.py:208`,
-logged as a warning, does not zero a score) and a 5 s one inside
-`compare_gold_target`, whose letter-versus-letter path is a plain string
-compare (`math_comparison.py:595-601`).
+| pattern | priority |
+|---|---|
+| `final answer is X. I hope` | 0 |
+| `final answer`, up to 100 characters, then `is X` | **50** |
+| `answer:` + X, which is what the prompt asks for | **100** |
+| `answer` + X, a letter at the start of the text or of a line, a bare letter | 150–300 |
 
-Remaining candidates, none confirmed:
+The priority-50 pattern (line 314) is loose: "final answer", then anything
+up to 100 characters, then "is" and a letter. A long reasoning trace
+produces such a phrase without meaning it as an answer. These are the spans
+LightEval graded in three real generations, each of which ended with a clean
+`Answer:` line giving the correct letter and scored zero:
 
-* `pattern.finditer(pred)` at `extractive_match_utils.py:604` is not
-  timeout-guarded and is run once per pattern over the whole generation;
-* `try_extract_without_anchor=True` admits a bare capital letter at priority
-  250/300, which a long answer can supply by accident — though a clean
-  `Answer: X` at priority 100 should outrank it;
-* the `signal.alarm` timeouts are main-thread only (`utils/timeout.py:40-51`),
-  so they behave differently under a threaded runner.
+> Need be careful: if final answer is A
+>
+> The final answer A. If the expected answer is C
+>
+> in final answer could mention "One product is B
 
-Until one of these is demonstrated, this repository ships **no GPQA patch**.
-What it ships is `tools/regrade.py`, which re-extracts and re-compares every
-item and reports the disagreements. A disagreement is evidence; a patch built
-on a guess is not.
+All three sit inside the reasoning, which LightEval was meant to remove and
+did not (§5). Priority 50 beats 100 wherever the two sit, so the phrase is
+graded. The longer the trace, the more chances there are for such a phrase,
+which is why these misreads sit in the tail of the length distribution.
+
+The explanation usually offered, a timeout, is ruled out. The
+`timeout_seconds=5` default (`metrics/dynamic_metrics.py:165`) is never used
+on this path: `extract_indices` (`extractive_match_utils.py:531-537`) is a
+regex group lookup with no sympy parsing and takes no timeout. The alarms
+that do exist are a 2 s one around writing to `doc.specific`
+(`dynamic_metrics.py:208`, logged as a warning, does not zero a score) and a
+5 s one inside `compare_gold_target`, whose letter-versus-letter path is a
+plain string compare (`math_comparison.py:595-601`). Extraction on the
+generations above takes milliseconds.
+
+What ships: patch 0003 (§5) makes the reasoning removal work, which removes
+these phrases before extraction, and `tools/regrade.py` re-extracts every item
+from its final answer and reports the disagreements.
 
 ---
 
@@ -367,18 +404,7 @@ templates put `<think>` at the end of the prompt, so the generation holds only
 `</think>`. Nothing is removed, nothing is logged, and extraction runs over
 the whole trace.
 
-### Why the patch does not fix the reasoning removal instead
-
-Removing everything up to a lone `</think>` is the obvious fix, and on AIME it
-corrects the same items. On MATH-500 it is not safe by itself. The reasoning
-it removes is what currently rescues final answers LightEval cannot parse
-(`ANSWER: 2k+2` without delimiters, `\boxed{ANSWER: 6}`), because a matching
-value earlier in the trace gets graded instead. Removal alone therefore
-swaps one set of wrong grades for another until the extraction problems in §2
-are fixed too. The re-grader here fixes both together (§2). The upstream
-patch is limited to the failure itself.
-
-### The patch
+### Patch 0002: skip the template
 
 `patches/0002-extraction-skip-restated-answer-placeholder.patch` makes
 `extract_target_from_pred` skip a match when every span it captured is a
@@ -411,6 +437,39 @@ at the token limit, which were graded under the truncation rule above. The
 restatement came from Qwen3.8-Flash-Next, in unquantized and quantized runs
 alike, and from both GLM models. It is a model habit, not a property of a
 checkpoint.
+
+### Patch 0003: make the removal work
+
+`patches/0003-reasoning-tags-closing-tag-only.patch` makes
+`remove_reasoning_tags` treat everything before a closing tag that has no
+opening tag ahead of it as reasoning, and then runs the original loop. A
+generation with both tags, or with neither, is handled exactly as before,
+and a generation cut off before `</think>` still has nothing removed.
+
+It was validated on the same runs plus every GPQA run: 118 runs and 17,846
+items, on which the unpatched implementation reproduces every recorded
+score.
+
+* **GPQA and AIME.** Grades now follow the stated final answer. The misreads
+  of §4 and the template misreads above are corrected. Some items also move
+  from 1 to 0, and those are corrections too. A few had been credited
+  through a phrase in the reasoning while the stated answer was a different,
+  wrong letter. A few more were cut off after `</think>`, before their final
+  answer, and had been credited with a value from the reasoning.
+* **MATH-500.** Changes go both ways. Most are gains. Most of the losses are
+  correct final answers written in a form §2 shows LightEval cannot read
+  (`ANSWER: 3R^2`), which had been credited only because the same value also
+  appeared, delimited, in the reasoning; the rest had a wrong or cut-off
+  final answer. On MATH-500 the patch therefore
+  swaps accidental credit for the §2 failures. Use it there together with the
+  re-grader, not alone.
+
+`tests/test_reasoning_tags_patch.py` applies it to a copy of the installed
+function.
+
+0002 is kept alongside because 0003 does nothing for a generation cut off
+before `</think>`. The whole trace is still searched there, and a restated
+template anywhere in it still wins at priority 0.
 
 ### The re-grader
 
@@ -540,20 +599,23 @@ leaves a forwarding shim rather than editing a package we do not own.
 
 The correction here is delivered by re-grading, not as a patch to
 `patches/`, and that is a deliberate choice rather than an omission. Fixing it
-upstream means two changes, and only one of them is small:
+upstream means three changes, and only the first is small:
 
 * **The priority inversion** is small: `math_500` shares `Metrics.pass_at_k_math`
   (`metrics/metrics.py:469-480`) with the AIME tasks, whose prompts *do*
   mandate `\boxed{}`. Raising `boxed_match_priority` above the `ANSWER:` tier
   would fix MATH-500 and break AIME, so it needs a second metric entry used
   only by tasks whose prompt asks for a final line.
+* **The answer line** is read only inside math delimiters (§2, item 3). It
+  needs a reading of the bare text after `ANSWER:` up to the end of the line,
+  parsed as LaTeX.
 * **The missing string target** is not small. `ExtractionTarget` is a union of
   three configs (`extractive_match_utils.py:96`) with no string member, which
   is why a word answer extracts nothing at all; LightEval's own comment asks
   for a `StringExtractionConfig` (`dynamic_metrics.py:174`). Adding one touches
   extraction, comparison and every task that uses them.
 
-Neither can be validated here the way the LCB patch was — that one has a
+None of them can be validated here the way the LCB patch was — that one has a
 minimal reproduction that runs in milliseconds, while these need a full
 evaluation against a model to show they changed the right scores. So they are
 specified rather than guessed at, and the re-grade path is what this repository
@@ -569,7 +631,8 @@ stands behind.
 * The text branch of `answers_equivalent` is a string comparison, not a
   semantic one. `"an ellipse"` and `"ellipse"` are different strings and will
   be reported as different answers.
-* GPQA is undiagnosed. See §4.
+* Patch 0003 alone trades one set of MATH-500 errors for another (§5). Use
+  it there with the re-grader.
 * The template words are exactly two, `ANSWER` and `LETTER`. A task whose
   template names its slot differently needs the word added to both the patch
   and `extraction.py`.
@@ -589,6 +652,6 @@ patches/             upstream diffs against lighteval 6ba40c4
 tools/
   regrade.py         re-score answers from a finished run's details
   regrade_lcb.py     re-run LiveCodeBench stdin candidates and re-score
-tests/               extraction, equivalence, the LCB rewrite, the AIME
-                     template patch, the harness
+tests/               extraction, equivalence, the LCB rewrite, patches 0002
+                     and 0003, the harness
 ```
